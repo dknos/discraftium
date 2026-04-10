@@ -216,19 +216,19 @@ PITCH_CORRECTION_THRESHOLD = 55  # beyond ±55° from horizon, force correction
 
 def camera_needs_correction(info):
     """Check if camera pitch is too extreme and needs auto-correction.
-    Luanti pitch: NEGATIVE = looking UP at sky, POSITIVE = looking DOWN at ground.
-    Returns: (action_id, steps) or (None, 0) if OK.
-    action 16 = mouse y+ but in Luanti this moves camera DOWN (towards ground).
-    action 17 = mouse y- but in Luanti this moves camera UP (towards sky).
-    CONFIRMED: action 17 = look up, action 16 = look down (Luanti inverted Y)."""
+    Luanti pitch: POSITIVE = looking DOWN at ground, NEGATIVE = looking UP at sky.
+    PROVEN BY LOGS (pitch 69→90 when action 17 sent):
+      action 16 = camera UP (decreases pitch, looks toward sky)
+      action 17 = camera DOWN (increases pitch, looks toward ground)
+    Gentle correction: max 4 steps to avoid overshooting."""
     pitch = info.get("player_pitch", 0) if isinstance(info, dict) else 0
-    if pitch < -PITCH_CORRECTION_THRESHOLD:
-        # Looking UP at sky (negative pitch) → need to look DOWN → action 16
-        steps = min(int((-pitch - 15) / 6) + 1, 12)
+    if pitch > PITCH_CORRECTION_THRESHOLD:
+        # Looking DOWN at ground (positive pitch) → need to look UP → action 16
+        steps = min(int((pitch - 40) / 25) + 1, 3)
         return 16, steps
-    elif pitch > PITCH_CORRECTION_THRESHOLD:
-        # Looking DOWN at ground (positive pitch) → need to look UP → action 17
-        steps = min(int((pitch - 15) / 6) + 1, 12)
+    elif pitch < -PITCH_CORRECTION_THRESHOLD:
+        # Looking UP at sky (negative pitch) → need to look DOWN → action 17
+        steps = min(int((-pitch - 40) / 25) + 1, 3)
         return 17, steps
     return None, 0
 
@@ -417,13 +417,14 @@ def force_break_loop(recent_actions, tick):
 
     # All same action 4+ times → force random different action
     if len(set(last_4)) == 1:
-        # EXCEPTION: use tool repeatedly = valid chopping. Allow up to 8 before intervening.
+        # EXCEPTION: use tool repeatedly = valid chopping via chop cycle.
+        # The cycle handles look up/down/fwd automatically. Only intervene after 12+
         if last_4[0] == "use tool":
-            last_8_actions = [a.split(": ")[-1] if ": " in a else a for a in recent_actions[-8:]]
-            if len(last_8_actions) >= 8 and all(a == "use tool" for a in last_8_actions):
-                print(f"  [STUCK] 8x use tool no progress — look for new target", flush=True)
-                return random.choice([14, 15, 1])
-            return None  # fewer than 8: let it chop
+            last_12 = [a.split(": ")[-1] if ": " in a else a for a in recent_actions[-12:]] if len(recent_actions) >= 12 else last_8
+            if len(last_12) >= 12 and all(a == "use tool" for a in last_12):
+                print(f"  [STUCK] 12x use tool — move to find new target", flush=True)
+                return random.choice([1, 14, 15, 1, 1])  # bias forward
+            return None  # let chop cycle handle it
         if tick > 300 and random.random() < 0.4:
             return random.choice([8, 9, 10, 11])  # place or hotbar select
         return random.choice(BREAK_LOOP_ACTIONS)
@@ -973,22 +974,58 @@ def main():
         chop_sticky = 0  # when >0, repeat "use tool" for this many more ticks
         horizon_cooldown = 0  # after auto-horizon, skip camera actions for N ticks
         fwd_blocked_count = 0  # consecutive FWD-BLOCKED events
+
+        # Tree chop cycle: after initial chop, cycle look up/down/fwd to get all trunk pieces
+        # Sequence: chop x4 → look up → chop x4 → look up → chop x4 → look down x2 → chop x4 → fwd → chop x4
+        CHOP_CYCLE = (
+            [7]*4 +   # chop at current level
+            [16] +     # look up 1 step (camera up = action 16)
+            [7]*4 +   # chop upper trunk
+            [16] +     # look up 1 more step
+            [7]*4 +   # chop even higher
+            [17]*2 +   # look back down to eye level
+            [7]*3 +   # chop at eye level again
+            [1]*2 +   # step forward (into where tree was)
+            [7]*3 +   # chop any remaining at new position
+            [5] +      # jump
+            [7]*2 +   # chop while in air (gets higher pieces)
+            [17]*1 +   # look slightly down (undo jump camera drift)
+            [1]*2     # move forward to clear the tree area
+        )
+        chop_cycle_idx = 0  # position in chop cycle
+        chop_cycle_active = False  # True when running the cycle
         for tick in range(args.max_ticks):
             agent = active_agents[0]
 
-            # Chop sticky: if we're mid-chop, keep swinging without asking LLM
-            if chop_sticky > 0:
-                chop_sticky -= 1
-                action_idx = 7  # use tool
-                action_name = "use tool"
+            # Chop cycle: when active, run through the full tree-chopping sequence
+            # (chop, look up, chop, look up, chop, look down, chop, step forward, chop+jump)
+            if chop_cycle_active and chop_cycle_idx < len(CHOP_CYCLE):
+                action_idx = CHOP_CYCLE[chop_cycle_idx]
+                chop_cycle_idx += 1
+                action_name = ACTION_NAMES[action_idx]
                 img = Image.fromarray(observation)
                 observation, reward, terminated, truncated, info = safe_step(remap_action(action_idx))
                 pos = info.get("player_pos", [0, 0, 0])
                 last_positions.append(pos[:])
                 if len(last_positions) > 30:
                     last_positions.pop(0)
+                if chop_cycle_idx >= len(CHOP_CYCLE):
+                    chop_cycle_active = False
+                    chop_cycle_idx = 0
+                    # Return to horizon after chop cycle using actual pitch
+                    pitch = info.get("player_pitch", 0) if isinstance(info, dict) else 0
+                    if abs(pitch) > 20:
+                        fix_action = 16 if pitch > 0 else 17  # 16=up, 17=down
+                        fix_steps = min(int(abs(pitch) / 25), 3)  # each step ≈ 25°
+                        for _ in range(fix_steps):
+                            observation, reward, terminated, truncated, info = safe_step(remap_action(fix_action))
+                        new_p = info.get("player_pitch", 0) if isinstance(info, dict) else 0
+                        print(f"  [{agent['name']}] tick {tick}: CHOP CYCLE complete, horizon fix {pitch:.0f}°→{new_p:.0f}°", flush=True)
+                    else:
+                        print(f"  [{agent['name']}] tick {tick}: CHOP CYCLE complete (pitch={pitch:.0f}° OK)", flush=True)
                 if terminated or truncated:
                     observation, info = env.reset()
+                    chop_cycle_active = False
                 continue
 
             # Only call LLM every N ticks; repeat last action otherwise
@@ -1000,7 +1037,8 @@ def main():
                     action_name = ACTION_NAMES[action_idx]
                     last_action_idx = action_idx
                     last_action_name = action_name
-                    chop_sticky = 0  # reset so we don't resume chopping same spot
+                    chop_cycle_active = False  # reset so we don't resume chopping same spot
+                    chop_cycle_idx = 0
                     fwd_blocked_count = 0
                     print(f"  [{agent['name']}] tick {tick}: LOOP BREAK -> {action_name}", flush=True)
                     recent_actions.append(f"{agent['name']}: {action_name}")
@@ -1010,13 +1048,13 @@ def main():
                     correction_action, correction_steps = camera_needs_correction(info)
                     if correction_action is not None:
                         pitch_val = info.get("player_pitch", 0) if isinstance(info, dict) else 0
-                        label = "DOWN(16)" if correction_action == 16 else "UP(17)"
+                        label = "UP(16)" if correction_action == 16 else "DOWN(17)"
                         print(f"  [{agent['name']}] tick {tick}: AUTO-HORIZON pitch={pitch_val:.0f}° → action {label} x{correction_steps}", flush=True)
                         for _ in range(correction_steps):
                             observation, reward, terminated, truncated, info = safe_step(remap_action(correction_action))
                         new_pitch = info.get("player_pitch", 0) if isinstance(info, dict) else 0
                         print(f"  [{agent['name']}] tick {tick}: pitch after correction: {new_pitch:.0f}°", flush=True)
-                        cam_label = "down" if correction_action == 16 else "up"
+                        cam_label = "up" if correction_action == 16 else "down"
                         recent_actions.append(f"{agent['name']}: move camera {cam_label}")
 
                     img_b64, img = obs_to_base64(observation, max_size=360)
@@ -1058,9 +1096,11 @@ def main():
                         action_idx = 1  # force move forward
                         print(f"  [{agent['name']}] tick {tick}: BLOCKED consecutive camera, forced FORWARD", flush=True)
                     action_name = ACTION_NAMES[action_idx]
-                    # Chop sticky: if "use tool", auto-repeat for 4 more ticks
-                    if action_idx == 7:
-                        chop_sticky = 4
+                    # Chop cycle: if "use tool", activate full tree-chop sequence
+                    if action_idx == 7 and not chop_cycle_active:
+                        chop_cycle_active = True
+                        chop_cycle_idx = 0
+                        print(f"  [{agent['name']}] tick {tick}: CHOP CYCLE started", flush=True)
                     last_action_idx = action_idx
                     last_action_name = action_name
                     print(f"  [{agent['name']}] tick {tick}: {response} -> {action_name} ({dt:.1f}s)", flush=True)
@@ -1094,7 +1134,7 @@ def main():
             last_positions.append(pos[:])
             if len(last_positions) > 30:
                 last_positions.pop(0)
-            if len(last_positions) >= 20 and tick % args.llm_every == 0:
+            if len(last_positions) >= 20 and tick % args.llm_every == 0 and not chop_cycle_active:
                 old_pos = last_positions[-20]
                 dx = abs(pos[0] - old_pos[0])
                 dz = abs(pos[2] - old_pos[2])
