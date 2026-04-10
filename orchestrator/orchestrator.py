@@ -107,13 +107,10 @@ def track_cost(provider, input_tokens, output_tokens, cache_read=0, cache_write=
 # Agent definitions — matches NemoClaw crew
 # ---------------------------------------------------------------------------
 
-GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-if not GEMINI_API_KEY:
-    try:
-        GEMINI_API_KEY = open("/tmp/gemini_key").read().strip()
-    except:
-        pass
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+# Vertex AI via gemini-proxy (Cloud billing, NOT AI Studio)
+# The proxy on :9340 translates OpenAI format → Vertex AI generateContent
+# and handles OAuth2 with SA key. Bills to drivenemo GCP project.
+GEMINI_ENDPOINT = "http://host.docker.internal:9340/v1/chat/completions"
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 if not ANTHROPIC_API_KEY:
@@ -167,7 +164,7 @@ AGENTS = [
         "name": "Pipes",
         "role": "builder",
         "endpoint": GEMINI_ENDPOINT,
-        "model": "gemini-3.1-flash-lite-preview",
+        "model": "gemini-flash-lite",
         "provider": "gemini",
         "personality": (
             "You are Pipes, the team lead and builder. You are action-oriented and decisive. "
@@ -181,7 +178,7 @@ AGENTS = [
         "name": "Candy",
         "role": "decorator",
         "endpoint": GEMINI_ENDPOINT,
-        "model": "gemini-3.1-flash-lite-preview",
+        "model": "gemini-flash-lite",
         "personality": (
             "You are Candy, the creative director. You care about aesthetics above all. "
             "When the team builds, you focus on making it look good — choosing materials, "
@@ -194,7 +191,7 @@ AGENTS = [
         "name": "MaoMao",
         "role": "safety",
         "endpoint": GEMINI_ENDPOINT,
-        "model": "gemini-3.1-flash-lite-preview",
+        "model": "gemini-flash-lite",
         "personality": (
             "You are MaoMao, the analytical safety officer. You monitor resources, watch for "
             "danger (mobs, lava, cliffs), and optimize efficiency. You keep inventory organized, "
@@ -207,7 +204,7 @@ AGENTS = [
         "name": "Hermes",
         "role": "strategist",
         "endpoint": GEMINI_ENDPOINT,
-        "model": "gemini-3.1-flash-lite-preview",
+        "model": "gemini-flash-lite",
         "personality": (
             "You are Hermes, the deep strategist. You think long-term: what resources do we need, "
             "what's the optimal crafting path, where should we explore. You research and plan while "
@@ -758,8 +755,6 @@ def call_llm(agent, system_prompt, user_prompt, img_base64):
             ]},
         ]
         endpoint = agent.get("endpoint", GEMINI_ENDPOINT)
-        if "googleapis.com" in endpoint and GEMINI_API_KEY:
-            _gemini_session.headers["Authorization"] = f"Bearer {GEMINI_API_KEY}"
         resp = _gemini_session.post(
             endpoint,
             json={
