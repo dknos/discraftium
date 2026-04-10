@@ -22,10 +22,42 @@ import io
 import traceback
 import threading
 import random
+import signal
+import atexit
+import glob as globmod
 import numpy as np
 from PIL import Image
 from argparse import ArgumentParser
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, Future
+
+
+def _cleanup_run_dirs():
+    """Remove leftover luanti-run-* directories on exit."""
+    for d in globmod.glob("/opt/craftium/luanti-run-*"):
+        try:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+            print(f"  [cleanup] removed {d}")
+        except Exception:
+            pass
+
+atexit.register(_cleanup_run_dirs)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # SIGTERM triggers atexit
+
+# ---------------------------------------------------------------------------
+# Persistent HTTP sessions — reuse TCP connections instead of per-request
+# ---------------------------------------------------------------------------
+_gemini_session = requests.Session()
+_anthropic_session = requests.Session()
+_discord_session = requests.Session()
+
+# Background thread pool for non-blocking IO (Discord, memory, cost writes)
+_io_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="io")
+
+# LLM prefetch — start next LLM call while game loop runs current actions
+_llm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
+_llm_future: Future = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Cost tracker — per-provider token counting + JSON export
@@ -94,27 +126,41 @@ HERMES_ENDPOINT = "http://host.docker.internal:9351/v1/chat/completions"
 MEMORY_SERVER = "http://host.docker.internal:7338"
 
 
-def recall_memories(query, user_id="hermes-minecraft", limit=3):
-    """Search Qdrant memory for game knowledge."""
+_recall_cache = []  # latest recall results, updated async
+_recall_future = None
+
+def _recall_memories_sync(query, user_id="hermes-minecraft", limit=3):
+    """Sync worker for memory recall (runs in background thread)."""
+    global _recall_cache
     try:
         resp = requests.post(MEMORY_SERVER, json={
             "cmd": "search", "query": query, "userId": user_id, "limit": limit
         }, timeout=5)
         data = resp.json()
-        return [r["text"] for r in data.get("results", [])]
+        _recall_cache = [r["text"] for r in data.get("results", [])]
     except Exception as e:
         print(f"  [memory] recall error: {e}", flush=True)
-        return []
+
+def recall_memories(query, user_id="hermes-minecraft", limit=3):
+    """Non-blocking memory recall — fires async, returns cached results."""
+    global _recall_future
+    if _recall_future is None or _recall_future.done():
+        _recall_future = _io_pool.submit(_recall_memories_sync, query, user_id, limit)
+    return _recall_cache
 
 
-def store_memory(text, user_id="hermes-minecraft", category="game-experience"):
-    """Store a game experience in Qdrant memory."""
+def _store_memory_sync(text, user_id="hermes-minecraft", category="game-experience"):
+    """Sync worker for memory store."""
     try:
         requests.post(MEMORY_SERVER, json={
             "cmd": "store", "text": text, "userId": user_id, "category": category
         }, timeout=5)
     except Exception:
         pass
+
+def store_memory(text, user_id="hermes-minecraft", category="game-experience"):
+    """Store a game experience in background (non-blocking)."""
+    _io_pool.submit(_store_memory_sync, text, user_id, category)
 
 AGENTS = [
     {
@@ -279,16 +325,16 @@ def obs_to_png_bytes(observation):
 
 
 def obs_to_base64(observation, max_size=720):
-    """Convert numpy RGB array to base64 PNG for API calls. Downscales for faster LLM."""
+    """Convert numpy RGB array to base64 JPEG for API calls. JPEG is ~5x smaller than PNG."""
     img = Image.fromarray(observation)
     # Downscale large observations for faster API calls
     if img.width > max_size or img.height > max_size:
         img = img.resize((max_size, max_size), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=75)  # JPEG: faster encode, smaller payload
     buf.seek(0)
-    png_bytes = buf.read()
-    return base64.b64encode(png_bytes).decode("utf-8"), img
+    jpg_bytes = buf.read()
+    return base64.b64encode(jpg_bytes).decode("utf-8"), img
 
 
 MINECRAFT_SOUL = """You are a Minecraft survival agent playing LIVE on YouTube. You see one screenshot per tick and must output exactly ONE action. Explore, gather resources, build structures. Never stand still.
@@ -432,10 +478,25 @@ def force_break_loop(recent_actions, tick):
     # OSCILLATION: alternating between 2 actions (up/down, left/right)
     if last_4[0] == last_4[2] and last_4[1] == last_4[3] and last_4[0] != last_4[1]:
         a, b = last_4[0], last_4[1]
-        # camera_down/up + use_tool = valid chopping a block at unusual angle
+        # camera + use_tool = valid chopping at unusual angle (allow short bursts only)
         productive = {("move camera down", "use tool"), ("use tool", "move camera down"),
                       ("move camera up", "use tool"), ("use tool", "move camera up")}
         if (a, b) in productive or (b, a) in productive:
+            # But if it's been going on for 8+ actions, it's stuck
+            if len(last_8) >= 8:
+                osc_count = sum(1 for i in range(len(last_8)-1) if last_8[i] != last_8[i+1])
+                if osc_count >= 6:
+                    print(f"  [STUCK] Prolonged {a}/{b} oscillation — escape", flush=True)
+                    return random.choice([1, 3, 4, 14, 15])
+            return None
+        # forward/use_tool oscillation = FWD-BLOCKED loop, break after 8 repeats
+        fwd_tool = {("move forward", "use tool"), ("use tool", "move forward")}
+        if (a, b) in fwd_tool or (b, a) in fwd_tool:
+            if len(last_8) >= 6:
+                ft_count = sum(1 for x in last_8 if x in ("move forward", "use tool"))
+                if ft_count >= 6:
+                    print(f"  [STUCK] forward/use_tool loop — turning to go around", flush=True)
+                    return random.choice([3, 4, 14, 15])
             return None
         print(f"  [STUCK] Oscillation: {a}/{b} — forward escape", flush=True)
         return 1  # move forward to change position
@@ -504,9 +565,14 @@ Keep it under 80 words. Be direct and actionable."""
         }
         # System prompt must be >1024 tokens for Anthropic cache to activate
         thinker_system = MINECRAFT_SOUL + "\n\nYou are a strategic advisor. Analyze the screenshot and give 2-3 SHORT actionable sentences (under 80 words). Focus on: what you see, what to do next, any danger."
-        resp = requests.post(
+        _anthropic_session.headers.update({
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
+        })
+        resp = _anthropic_session.post(
             ANTHROPIC_ENDPOINT,
-            headers=headers,
             json={
                 "model": "claude-haiku-4-5",
                 "system": [
@@ -514,7 +580,7 @@ Keep it under 80 words. Be direct and actionable."""
                      "cache_control": {"type": "ephemeral"}},
                 ],
                 "messages": [{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_base64}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_base64}},
                     {"type": "text", "text": prompt},
                 ]}],
                 "max_tokens": 120,
@@ -645,87 +711,81 @@ def build_prompt(agent, info, goal, recent_actions, tick):
 
 
 def call_llm(agent, system_prompt, user_prompt, img_base64):
-    """Call agent's LLM endpoint with vision. Supports Anthropic and OpenAI-compat."""
-    import concurrent.futures
-
+    """Call agent's LLM endpoint with vision. Uses persistent sessions for connection reuse."""
     provider = agent.get("provider", "gemini")
 
-    def _do_call():
-        if provider == "anthropic":
-            # Anthropic Messages API format
-            headers = {
-                "Content-Type": "application/json",
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-            }
-            body = {
-                "model": agent["model"],
-                "system": system_prompt,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_base64,
-                        }},
-                        {"type": "text", "text": user_prompt},
-                    ],
-                }],
-                "max_tokens": 200,
-                "temperature": 0.3,
-            }
-            resp = requests.post(ANTHROPIC_ENDPOINT, headers=headers, json=body, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            usage = data.get("usage", {})
-            track_cost("anthropic", usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-            content = ""
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    content += block["text"]
-            return content.strip() if content else "move forward"
-        else:
-            # OpenAI-compat (Gemini etc.)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/png;base64,{img_base64}"
+    if provider == "anthropic":
+        _anthropic_session.headers.update({
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        })
+        body = {
+            "model": agent["model"],
+            "system": system_prompt,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_base64,
                     }},
-                ]},
-            ]
-            headers = {"Content-Type": "application/json"}
-            endpoint = agent.get("endpoint", GEMINI_ENDPOINT)
-            if "googleapis.com" in endpoint and GEMINI_API_KEY:
-                headers["Authorization"] = f"Bearer {GEMINI_API_KEY}"
-            resp = requests.post(
-                endpoint,
-                headers=headers,
-                json={
-                    "model": agent["model"],
-                    "messages": messages,
-                    "max_tokens": 200,
-                    "temperature": 0.4,
-                },
-                timeout=6,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            usage = data.get("usage", {})
-            track_cost("gemini", usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-            choice = data.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content", "")
-            return content.strip() if content else "move forward"
+                    {"type": "text", "text": user_prompt},
+                ],
+            }],
+            "max_tokens": 200,
+            "temperature": 0.3,
+        }
+        resp = _anthropic_session.post(ANTHROPIC_ENDPOINT, json=body, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        usage = data.get("usage", {})
+        track_cost("anthropic", usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        content = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                content += block["text"]
+        return content.strip() if content else "move forward"
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_base64}"
+                }},
+            ]},
+        ]
+        endpoint = agent.get("endpoint", GEMINI_ENDPOINT)
+        if "googleapis.com" in endpoint and GEMINI_API_KEY:
+            _gemini_session.headers["Authorization"] = f"Bearer {GEMINI_API_KEY}"
+        resp = _gemini_session.post(
+            endpoint,
+            json={
+                "model": agent["model"],
+                "messages": messages,
+                "max_tokens": 200,
+                "temperature": 0.4,
+            },
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        usage = data.get("usage", {})
+        track_cost("gemini", usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        choice = data.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "")
+        return content.strip() if content else "move forward"
 
+
+def call_llm_safe(agent, system_prompt, user_prompt, img_base64):
+    """Wrapper with error handling."""
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_do_call)
-            return future.result(timeout=6)
+        return call_llm(agent, system_prompt, user_prompt, img_base64)
     except Exception as e:
         print(f"  [{agent['name']}] LLM error: {repr(e)}", flush=True)
-        return "move forward"  # safe fallback
+        return "move forward"
 
 
 def parse_action(response_text):
@@ -767,27 +827,28 @@ def parse_action(response_text):
     return 1  # default: move forward
 
 
-def post_screenshot_to_discord(img, agent_name, action_text, tick):
-    """Post a screenshot to Discord #errors channel."""
+def _post_screenshot_sync(png_bytes, agent_name, action_text, tick):
+    """Sync worker for Discord screenshot post (runs in background thread)."""
     try:
         token = os.environ.get("DISCORD_BOT_TOKEN", "")
         if not token:
             return
         channel = os.environ.get("MC_DISCORD_CHANNEL", "915789984282325016")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-
-        requests.post(
+        _discord_session.post(
             f"https://discord.com/api/v10/channels/{channel}/messages",
             headers={"Authorization": f"Bot {token}"},
             data={"content": f"**[{agent_name}]** tick {tick}: {action_text}"},
-            files={"file": ("screenshot.png", buf, "image/png")},
+            files={"file": ("screenshot.png", io.BytesIO(png_bytes), "image/png")},
             timeout=10,
         )
     except Exception as e:
         print(f"  Discord post error: {e}")
+
+def post_screenshot_to_discord(img, agent_name, action_text, tick):
+    """Post screenshot to Discord in background (non-blocking)."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    _io_pool.submit(_post_screenshot_sync, buf.getvalue(), agent_name, action_text, tick)
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +856,7 @@ def post_screenshot_to_discord(img, agent_name, action_text, tick):
 # ---------------------------------------------------------------------------
 
 def main():
+    global _llm_future
     parser = ArgumentParser(description="DiscoClaw Craftium Orchestrator")
     parser.add_argument("--agents", type=int, default=4, help="Number of agents (1-4)")
     parser.add_argument("--goal", type=str, default="Gather wood, then build an awesome house! Chop trees first, then place blocks to build walls and a roof.",
@@ -835,7 +897,7 @@ def main():
         smooth_lighting=False,
         performance_tradeoffs=True,
         enable_particles=False,
-        mg_name="flat",  # flat for backrooms (Lua mapgen), valleys for overworld
+        mg_name="valleys",  # valleys = mountains/rivers/forests, flat = backrooms
         time_speed=0,  # freeze time (no day/night cycle)
         static_spawntime=5500,  # permanent morning light
         # Peaceful — no hostile mobs (zombies, skeletons, etc.)
@@ -863,6 +925,7 @@ def main():
             minetest_conf=config,
             sync_mode=True,
             pmul=3,  # default is 20 (way too fast). 3 = natural walking speed
+            mt_listen_timeout=180_000,  # 3 min — non-VoxeLibre envs load slow
         )
         if args.game:
             gym_kwargs["game_id"] = args.game
@@ -940,7 +1003,6 @@ def main():
             return _remap.get(idx, 1 if n_actions > 1 else 0)
 
         # Safe env.step with timeout to prevent infinite hangs
-        import signal
         def _step_timeout_handler(signum, frame):
             raise TimeoutError("env.step() hung for >10s")
         def safe_step(action):
@@ -1003,6 +1065,9 @@ def main():
                 action_idx = CHOP_CYCLE[chop_cycle_idx]
                 chop_cycle_idx += 1
                 action_name = ACTION_NAMES[action_idx]
+                recent_actions.append(f"{agent['name']}: {action_name}")
+                if len(recent_actions) > 50:
+                    recent_actions = recent_actions[-50:]
                 img = Image.fromarray(observation)
                 observation, reward, terminated, truncated, info = safe_step(remap_action(action_idx))
                 pos = info.get("player_pos", [0, 0, 0])
@@ -1058,12 +1123,24 @@ def main():
                         recent_actions.append(f"{agent['name']}: move camera {cam_label}")
 
                     img_b64, img = obs_to_base64(observation, max_size=360)
-                    # Thinker: smarter model analyzes every 15 ticks
-                    call_thinker(img_b64, info, recent_actions, tick, goal)
+                    # Thinker: smarter model gets higher-res view (720px) for better analysis
+                    thinker_b64, _ = obs_to_base64(observation, max_size=720)
+                    call_thinker(thinker_b64, info, recent_actions, tick, goal)
                     system, user = build_prompt(agent, info, goal, recent_actions, tick)
                     t0 = time.time()
-                    response = call_llm(agent, system, user, img_b64)
-                    dt = time.time() - t0
+                    # Use prefetched result if available, otherwise call synchronously
+                    if _llm_future is not None and _llm_future.done():
+                        try:
+                            response = _llm_future.result(timeout=0.1)
+                            _llm_future = None
+                            dt = time.time() - t0
+                            # Prefetch was from previous obs — still useful for action continuity
+                        except Exception:
+                            response = call_llm_safe(agent, system, user, img_b64)
+                            dt = time.time() - t0
+                    else:
+                        response = call_llm_safe(agent, system, user, img_b64)
+                        dt = time.time() - t0
                     action_idx = parse_action(response)
                     # MOVEMENT BLOCKED → CHOP override:
                     # If LLM chose move forward but position hasn't changed since last LLM call,
@@ -1075,14 +1152,14 @@ def main():
                         dz = abs(cur_est[2] - prev_pos[2])
                         if dx < 0.5 and dz < 0.5:
                             fwd_blocked_count += 1
-                            if fwd_blocked_count >= 6:
+                            if fwd_blocked_count >= 4:
                                 # Stuck too long mining — go around instead
                                 action_idx = random.choice([3, 4, 14, 15])  # strafe or turn
                                 fwd_blocked_count = 0
-                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED x6 → go around: {ACTION_NAMES[action_idx]}", flush=True)
+                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED x4 → go around: {ACTION_NAMES[action_idx]}", flush=True)
                             else:
                                 action_idx = 7  # use tool
-                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED → use tool ({fwd_blocked_count}/6)", flush=True)
+                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED → use tool ({fwd_blocked_count}/4)", flush=True)
                         else:
                             fwd_blocked_count = 0
                     # SAFETY: if Y is dropping, ban digging to prevent deeper holes
@@ -1105,16 +1182,17 @@ def main():
                     last_action_name = action_name
                     print(f"  [{agent['name']}] tick {tick}: {response} -> {action_name} ({dt:.1f}s)", flush=True)
                     recent_actions.append(f"{agent['name']}: {action_name}")
+                    if len(recent_actions) > 50:
+                        recent_actions = recent_actions[-50:]
                     # Write thinking to file for stream overlay
                     try:
-                        import json as _json
                         thinking = {"agent": agent["name"], "tick": tick, "action": action_name}
                         for line in response.split("\n"):
                             l = line.strip()
                             if l.upper().startswith("OBS:"): thinking["obs"] = l.split(":",1)[1].strip()[:120]
                             elif l.upper().startswith("GOAL:"): thinking["goal"] = l.split(":",1)[1].strip()[:80]
                         with open("/tmp/ai-thinking.json", "w") as f:
-                            _json.dump(thinking, f)
+                            json.dump(thinking, f)
                     except:
                         pass
             else:
@@ -1128,6 +1206,12 @@ def main():
                 observation, reward, terminated, truncated, info = safe_step(remap_action(1))
             else:
                 observation, reward, terminated, truncated, info = safe_step(remap_action(action_idx))
+
+            # Fire off LLM prefetch with NEW observation (ready for next LLM tick)
+            if tick % args.llm_every == 0 and not chop_cycle_active:
+                next_b64, _ = obs_to_base64(observation, max_size=360)
+                next_sys, next_usr = build_prompt(agent, info, goal, recent_actions, tick)
+                _llm_future = _llm_pool.submit(call_llm_safe, agent, next_sys, next_usr, next_b64)
 
             # Track position — detect physically stuck
             pos = info.get("player_pos", [0, 0, 0])
