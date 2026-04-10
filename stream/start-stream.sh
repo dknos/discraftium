@@ -115,7 +115,7 @@ docker exec craftium-discoclaw bash -c "echo 'Explore the world! Find trees, cho
 docker exec craftium-discoclaw bash -c "
     rm -rf /opt/craftium/minetest-*
     cd /opt/craftium && DISPLAY=:99 PYTHONUNBUFFERED=1 \
-    python3 orchestrator.py --agents 1 --obs-size 360 --xvfb-display :99 --frameskip 4 \
+    python3 orchestrator.py --agents 1 --obs-size 360 --xvfb-display :99 --frameskip 4 --env Craftium/ProcDungeons-v0 \
     > /tmp/orch.log 2>&1 &
 "
 echo "  ✓ Orchestrator starting (takes ~60s to load world)"

@@ -370,6 +370,38 @@ GOLDEN RULES:
 - Camera adjustments are a MEANS to an end, never the goal.
 - When in doubt, move forward.
 - One action per tick. Nothing else.
+
+## VOXELIBRE BLOCKS AND MATERIALS
+- Birch tree trunks: white/gray bark, vertical. Chop for birch wood planks.
+- Oak tree trunks: dark brown bark. Chop for oak wood planks.
+- Stone/cobblestone: gray blocks. Need a pickaxe to mine efficiently.
+- Dirt/grass: brown below, green on top surface. Easy to dig with hands.
+- Sand: yellow/beige. Found near water.
+- Gravel: speckled gray. Falls when unsupported.
+- Water: blue, reflective surface. Avoid falling in without a plan.
+- Lava: orange/red glow. AVOID — instant death or heavy damage.
+- Iron ore: stone with brown/orange specks. Need stone pickaxe minimum.
+- Coal ore: stone with black specks. Good for torches.
+
+## CRAFTING PROGRESSION
+1. Wood → planks → sticks → wooden tools
+2. Stone → cobblestone → stone tools (better durability)
+3. Iron ore → smelt → iron ingots → iron tools (best common tools)
+4. Diamond → diamond tools (endgame)
+
+## BUILDING TIPS FOR VIEWERS
+- Simple house: 4 walls (5x3 each) + roof + door
+- Tower: 3x3 base, stack 10+ blocks high, add windows
+- Bridge: pillars every 5 blocks, planks across
+- Use different materials for contrast (wood walls, stone base)
+- Symmetry and patterns look good on stream
+
+## TERRAIN TYPES
+- Forest: dense trees, good for wood. Watch for getting stuck between trunks.
+- Plains: open flat grass. Good visibility, easy building spots.
+- Mountains: steep terrain, exposed stone. Good for mining.
+- Caves: dark, underground. Dangerous without torches.
+- River/lake: water bodies. Build bridges or go around.
 """
 
 # Forced action override when stuck in loops
@@ -467,14 +499,17 @@ Keep it under 80 words. Be direct and actionable."""
             "Content-Type": "application/json",
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
         }
+        # System prompt must be >1024 tokens for Anthropic cache to activate
+        thinker_system = MINECRAFT_SOUL + "\n\nYou are a strategic advisor. Analyze the screenshot and give 2-3 SHORT actionable sentences (under 80 words). Focus on: what you see, what to do next, any danger."
         resp = requests.post(
             ANTHROPIC_ENDPOINT,
             headers=headers,
             json={
                 "model": "claude-haiku-4-5",
                 "system": [
-                    {"type": "text", "text": "You are a concise Minecraft strategy advisor. Keep answers under 80 words.",
+                    {"type": "text", "text": thinker_system,
                      "cache_control": {"type": "ephemeral"}},
                 ],
                 "messages": [{"role": "user", "content": [
@@ -673,7 +708,7 @@ def call_llm(agent, system_prompt, user_prompt, img_base64):
                     "max_tokens": 200,
                     "temperature": 0.4,
                 },
-                timeout=3.5,
+                timeout=6,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -686,7 +721,7 @@ def call_llm(agent, system_prompt, user_prompt, img_base64):
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_do_call)
-            return future.result(timeout=3.5)
+            return future.result(timeout=6)
     except Exception as e:
         print(f"  [{agent['name']}] LLM error: {repr(e)}", flush=True)
         return "move forward"  # safe fallback
@@ -765,7 +800,7 @@ def main():
                         help="Initial goal for the crew")
     parser.add_argument("--screenshots", type=str, default=None, help="Save screenshots to this dir")
     parser.add_argument("--discord-interval", type=int, default=30, help="Post to Discord every N ticks")
-    parser.add_argument("--max-ticks", type=int, default=1000, help="Max game ticks")
+    parser.add_argument("--max-ticks", type=int, default=100000, help="Max game ticks")
     parser.add_argument("--obs-size", type=int, default=256, help="Observation image size")
     parser.add_argument("--frameskip", type=int, default=8, help="Frames to skip between agent decisions")
     parser.add_argument("--xvfb-display", type=str, default=None,
@@ -774,6 +809,8 @@ def main():
                         help="Call LLM every N ticks; repeat last action between calls")
     parser.add_argument("--game", type=str, default=None,
                         help="Luanti game ID to load (e.g. backroomtest, capturetheflag, glitch, void). Default: VoxeLibre")
+    parser.add_argument("--env", type=str, default="Craftium/OpenWorld-v0",
+                        help="Gymnasium env ID (Craftium/OpenWorld-v0, Craftium/ProcDungeons-v0, Craftium/Speleo-v0, etc.)")
     args = parser.parse_args()
 
     num_agents = min(args.agents, 4)
@@ -797,7 +834,9 @@ def main():
         smooth_lighting=False,
         performance_tradeoffs=True,
         enable_particles=False,
-        mg_name="flat",  # flat world — no ravines/holes to fall into
+        mg_name="flat",  # flat for backrooms (Lua mapgen), valleys for overworld
+        time_speed=0,  # freeze time (no day/night cycle)
+        static_spawntime=5500,  # permanent morning light
         # Peaceful — no hostile mobs (zombies, skeletons, etc.)
         only_peaceful_mobs=True,
         mcl_mobs_spawn=False,  # VoxeLibre mob spawning
@@ -826,7 +865,92 @@ def main():
         )
         if args.game:
             gym_kwargs["game_id"] = args.game
-        env = gym.make("Craftium/OpenWorld-v0", **gym_kwargs)
+        env = gym.make(args.env, **gym_kwargs)
+
+        # Detect action space and build remapping if env has fewer actions
+        n_actions = env.action_space.n if hasattr(env.action_space, 'n') else len(ACTION_NAMES)
+        # Get the wrapper's action names if available
+        env_actions = None
+        inner = env
+        while hasattr(inner, 'env'):
+            if hasattr(inner, 'actions'):
+                env_actions = inner.actions
+                break
+            inner = inner.env
+        if env_actions:
+            print(f"Env actions ({len(env_actions)}): {env_actions}")
+            # Build remap: our ACTION_NAMES index → env discrete action index
+            # DiscreteActionWrapper: 0=NOP, 1=first_action, 2=second_action, ...
+            # So env_actions[i] corresponds to discrete index i+1
+            _remap = {}
+            for our_idx, our_name in enumerate(ACTION_NAMES):
+                best = None
+                if our_name == "do nothing":
+                    best = 0  # NOP
+                elif "forward" in our_name and "camera" not in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "forward" in a: best = i + 1; break
+                elif "backward" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "backward" in a or "back" in a: best = i + 1; break
+                elif our_name == "move left":
+                    for i, a in enumerate(env_actions):
+                        if a == "left": best = i + 1; break
+                elif our_name == "move right":
+                    for i, a in enumerate(env_actions):
+                        if a == "right": best = i + 1; break
+                elif "jump" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "jump" in a: best = i + 1; break
+                elif our_name == "use tool":
+                    for i, a in enumerate(env_actions):
+                        if "dig" in a: best = i + 1; break
+                elif our_name == "sneak":
+                    for i, a in enumerate(env_actions):
+                        if "sneak" in a: best = i + 1; break
+                elif "camera right" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "mouse x+" in a or "x+" in a: best = i + 1; break
+                elif "camera left" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "mouse x-" in a or "x-" in a: best = i + 1; break
+                elif our_name == "place":
+                    for i, a in enumerate(env_actions):
+                        if "place" in a: best = i + 1; break
+                elif "hotbar slot" in our_name or "select" in our_name:
+                    slot = our_name.split()[-1] if our_name.split() else ""
+                    for i, a in enumerate(env_actions):
+                        if f"slot_{slot}" in a or f"slot {slot}" in a: best = i + 1; break
+                elif "camera up" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "mouse y+" in a or "y+" in a: best = i + 1; break
+                elif "camera down" in our_name:
+                    for i, a in enumerate(env_actions):
+                        if "mouse y-" in a or "y-" in a: best = i + 1; break
+                if best is not None:
+                    _remap[our_idx] = best
+                else:
+                    _remap[our_idx] = 1 if n_actions > 1 else 0  # fallback: forward
+            print(f"Action remap: {_remap}")
+        else:
+            _remap = {i: i for i in range(len(ACTION_NAMES))}
+
+        def remap_action(idx):
+            return _remap.get(idx, 1 if n_actions > 1 else 0)
+
+        # Safe env.step with timeout to prevent infinite hangs
+        import signal
+        def _step_timeout_handler(signum, frame):
+            raise TimeoutError("env.step() hung for >10s")
+        def safe_step(action):
+            old = signal.signal(signal.SIGALRM, _step_timeout_handler)
+            signal.alarm(10)
+            try:
+                result = env.step(action)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+            return result
 
         # Patch proc_env before reset() spawns minetest
         import craftium as _craftium_pkg
@@ -848,6 +972,7 @@ def main():
         last_positions = []  # track position to detect being stuck
         chop_sticky = 0  # when >0, repeat "use tool" for this many more ticks
         horizon_cooldown = 0  # after auto-horizon, skip camera actions for N ticks
+        fwd_blocked_count = 0  # consecutive FWD-BLOCKED events
         for tick in range(args.max_ticks):
             agent = active_agents[0]
 
@@ -857,7 +982,7 @@ def main():
                 action_idx = 7  # use tool
                 action_name = "use tool"
                 img = Image.fromarray(observation)
-                observation, reward, terminated, truncated, info = env.step(action_idx)
+                observation, reward, terminated, truncated, info = safe_step(remap_action(action_idx))
                 pos = info.get("player_pos", [0, 0, 0])
                 last_positions.append(pos[:])
                 if len(last_positions) > 30:
@@ -875,6 +1000,8 @@ def main():
                     action_name = ACTION_NAMES[action_idx]
                     last_action_idx = action_idx
                     last_action_name = action_name
+                    chop_sticky = 0  # reset so we don't resume chopping same spot
+                    fwd_blocked_count = 0
                     print(f"  [{agent['name']}] tick {tick}: LOOP BREAK -> {action_name}", flush=True)
                     recent_actions.append(f"{agent['name']}: {action_name}")
                     img = Image.fromarray(observation)
@@ -886,7 +1013,7 @@ def main():
                         label = "DOWN(16)" if correction_action == 16 else "UP(17)"
                         print(f"  [{agent['name']}] tick {tick}: AUTO-HORIZON pitch={pitch_val:.0f}° → action {label} x{correction_steps}", flush=True)
                         for _ in range(correction_steps):
-                            observation, reward, terminated, truncated, info = env.step(correction_action)
+                            observation, reward, terminated, truncated, info = safe_step(remap_action(correction_action))
                         new_pitch = info.get("player_pitch", 0) if isinstance(info, dict) else 0
                         print(f"  [{agent['name']}] tick {tick}: pitch after correction: {new_pitch:.0f}°", flush=True)
                         cam_label = "down" if correction_action == 16 else "up"
@@ -909,8 +1036,17 @@ def main():
                         dx = abs(cur_est[0] - prev_pos[0])
                         dz = abs(cur_est[2] - prev_pos[2])
                         if dx < 0.5 and dz < 0.5:
-                            action_idx = 7  # use tool — mine the block we're pressed against
-                            print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED → use tool (pos delta {dx:.2f},{dz:.2f})", flush=True)
+                            fwd_blocked_count += 1
+                            if fwd_blocked_count >= 6:
+                                # Stuck too long mining — go around instead
+                                action_idx = random.choice([3, 4, 14, 15])  # strafe or turn
+                                fwd_blocked_count = 0
+                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED x6 → go around: {ACTION_NAMES[action_idx]}", flush=True)
+                            else:
+                                action_idx = 7  # use tool
+                                print(f"  [{agent['name']}] tick {tick}: FWD-BLOCKED → use tool ({fwd_blocked_count}/6)", flush=True)
+                        else:
+                            fwd_blocked_count = 0
                     # SAFETY: if Y is dropping, ban digging to prevent deeper holes
                     cur_y = info.get("player_pos", [0,0,0])[1]
                     if cur_y < 10 and action_idx == 7:  # use tool at low Y (below surface)
@@ -948,10 +1084,10 @@ def main():
 
             # Jump = jump + forward
             if action_name == "jump":
-                env.step(action_idx)
-                observation, reward, terminated, truncated, info = env.step(1)
+                safe_step(remap_action(action_idx))
+                observation, reward, terminated, truncated, info = safe_step(remap_action(1))
             else:
-                observation, reward, terminated, truncated, info = env.step(action_idx)
+                observation, reward, terminated, truncated, info = safe_step(remap_action(action_idx))
 
             # Track position — detect physically stuck
             pos = info.get("player_pos", [0, 0, 0])
@@ -967,7 +1103,7 @@ def main():
                     # mining is normal. Only escape if not making progress AND not chopping.
                     recent_names_20 = [a.split(": ")[-1] if ": " in a else a for a in recent_actions[-20:]]
                     chop_count = sum(1 for a in recent_names_20 if a == "use tool")
-                    if chop_count >= 4:
+                    if chop_count >= 2:
                         # Been chopping — let it continue, don't escape
                         pass
                     else:
@@ -975,11 +1111,11 @@ def main():
                         # ESCAPE: jump + strafe — more effective against tree walls than walk
                         direction = random.choice([3, 4])  # left or right strafe
                         print(f"  [ESCAPE] Jump + strafe", flush=True)
-                        env.step(5)  # jump
+                        safe_step(remap_action(5))  # jump
                         for _ in range(3):
-                            env.step(direction)  # strafe
+                            safe_step(remap_action(direction))  # strafe
                         for _ in range(2):
-                            observation, reward, terminated, truncated, info = env.step(1)  # forward
+                            observation, reward, terminated, truncated, info = safe_step(remap_action(1))  # forward
                         new_y = info.get("player_pos", [0, 0, 0])[1]
                         print(f"  [ESCAPE] After escape: Y={new_y:.0f} (was {pos[1]:.0f})", flush=True)
                         last_positions.clear()
