@@ -27,7 +27,6 @@ class Minetest():
             run_dir: Optional[os.PathLike] = None,
             run_dir_prefix: Optional[os.PathLike] = None,
             headless: bool = False,
-            gpu_id: Optional[int] = None,
             seed: Optional[int] = None,
             game_id: str = "minetest",
             world_name: str = "world",
@@ -172,12 +171,8 @@ class Minetest():
         self.stderr, self.stdout = None, None
 
         if headless:
-            self.proc_env = {"SDL_VIDEODRIVER": "offscreen"}
-            # If a GPU id was passed, set this environment variable to tell SDL to render using that GPU.
-            # Different env variables might need to be set on different systems. 
-            if gpu_id is not None:
-                print(f"==> Setting Luanti to render on GPU {gpu_id} by setting SDL_HINT_EGL_DEVICE={gpu_id}")
-                self.proc_env["SDL_HINT_EGL_DEVICE"] = f"{gpu_id}"
+            self.proc_env = os.environ.copy()
+            self.proc_env["SDL_VIDEODRIVER"] = "offscreen"
         else:
             self.proc_env = None
 
@@ -393,7 +388,8 @@ class MTServerOnly():
         self.proc = None  # holds mintest's process
         self.stderr, self.stdout = None, None
 
-        self.proc_env = {"SDL_VIDEODRIVER": "offscreen"}
+        self.proc_env = os.environ.copy()
+        self.proc_env["SDL_VIDEODRIVER"] = "offscreen"
 
     def start_process(self):
         if self.pipe_proc:
@@ -471,7 +467,7 @@ class MTServerOnly():
             for item in os.listdir(sync_dir):
                 src = os.path.join(sync_dir, item)
                 tgt = os.path.join(target_dir, item)
-                if os.path.isfile(item):  # if it's a file
+                if os.path.isfile(src):  # if it's a file
                     shutil.copy(src, tgt)
                 else:  # is a directory
                     shutil.copytree(src, tgt, dirs_exist_ok=True)
@@ -614,7 +610,11 @@ class MTClientOnly():
         self.proc = None  # holds mintest's process
         self.stderr, self.stdout = None, None
 
-        self.proc_env = {"SDL_VIDEODRIVER": "offscreen"} if headless else None
+        if headless:
+            self.proc_env = os.environ.copy()
+            self.proc_env["SDL_VIDEODRIVER"] = "offscreen"
+        else:
+            self.proc_env = None
 
     def start_process(self):
         if self.pipe_proc:
@@ -686,7 +686,7 @@ class MTClientOnly():
             for item in os.listdir(sync_dir):
                 src = os.path.join(sync_dir, item)
                 tgt = os.path.join(target_dir, item)
-                if os.path.isfile(item):  # if it's a file
+                if os.path.isfile(src):  # if it's a file
                     shutil.copy(src, tgt)
                 else:  # is a directory
                     shutil.copytree(src, tgt, dirs_exist_ok=True)

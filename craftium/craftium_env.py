@@ -1,5 +1,8 @@
 import os
+import atexit
+import signal
 from typing import Optional, Any
+from copy import deepcopy
 
 from .mt_channel import MtChannel
 from .minetest import Minetest
@@ -48,7 +51,6 @@ class CraftiumEnv(Env):
     :param pmul: Physics multiplier. As craftium agent's take actions by frame, default movement speeds make the agent move slowly. When set to > 1, minetest's movement velocity and acceleration increase helping the agent to move at acceptable relative speeds.
     :param soft_reset: If set to true, resets will have to be handled by the Lua mod and minetest won't be killed and rerun every call to restart. **IMPORTANT:** Only set this flag to `True` in environments that support this feature.
     :param offscreen_sdl: Whether to use the `offscreen` SDL driver or not (true by default).
-    :param gpu_id: If a GPU id was passed, set `SDL_HINT_EGL_DEVICE` to render the environment using that GPU.
     :param human_screeen_size: Size (width, height) of the render screen when `render_mode` is set to `"human"`.
     :param _minetest_conf: The default minetest configuration provided during environment registration.
     :param _voxel_obs_available: This flag indicates environments that support voxel observations during registration (do not manually override).
@@ -82,10 +84,9 @@ class CraftiumEnv(Env):
             seed: Optional[int] = None,
             sync_mode: bool = False,
             fps_max: int = 200,
-            pmul: int = 20,
+            pmul: int = 3,
             soft_reset: bool = False,
             offscreen_sdl: bool = True,
-            gpu_id: Optional[int] = None,
             human_screen_size: tuple[int, int] = (720, 720),
             _minetest_conf: dict[str, Any] = dict(),
             _voxel_obs_available: bool = False,
@@ -154,7 +155,6 @@ class CraftiumEnv(Env):
             run_dir=run_dir,
             run_dir_prefix=run_dir_prefix,
             headless=offscreen_sdl,
-            gpu_id=gpu_id,
             seed=seed,
             game_id=game_id,
             sync_dir=env_dir,
@@ -187,6 +187,16 @@ class CraftiumEnv(Env):
 
         self.last_observation = None  # used in render if "rgb_array"
         self.timesteps = 0  # the timesteps counter
+
+        # Ensure cleanup on exit to prevent leaked run directories
+        atexit.register(self._atexit_cleanup)
+
+    def _atexit_cleanup(self):
+        """Clean up on process exit to prevent leaked run directories."""
+        try:
+            self.close(clear=True)
+        except Exception:
+            pass
 
     def _get_info(self):
         return dict()
@@ -341,7 +351,7 @@ class CraftiumEnv(Env):
         if self.render_mode == "rgb_array":
             return self.last_observation
 
-    def close(self, clear: bool = True):
+    def close(self, *, clear: bool = True, **kwargs):
         """
         Closes the environment and removes temporary files.
 

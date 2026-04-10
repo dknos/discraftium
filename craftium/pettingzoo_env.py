@@ -59,7 +59,7 @@ class raw_env(AECEnv):
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
-        return self.env.observation_space[0]
+        return self.env.observation_space
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent):
